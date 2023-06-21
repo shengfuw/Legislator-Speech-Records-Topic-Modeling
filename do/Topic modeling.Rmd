@@ -1,0 +1,1276 @@
+---
+title: "Final Project"
+author: "Shengfu Wang 王聖夫（r11325008）"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# 分析立委發言紀錄
+
+Load packages
+```{r}
+library(readxl)
+library(tidyverse)
+library(tidytext)
+library(wordcloud2)
+library(jiebaR)
+library(tm)
+library(topicmodels)
+library(stm)
+library(stminsights)
+
+setwd("/Users/Shengfu/Desktop/臺大/統計學習理論簡介 曾煥凱/Final Project/Analysis/do")
+list.files()
+rm(list = ls())
+```
+
+
+### Data Preprocess
+
+#### Import data
+```{r}
+## 1. Gazette Info.
+gazette_selected <- read_csv("../workdata/公報_selected.csv")
+
+# Convert meeting date
+gazette_selected <- gazette_selected %>% 
+    mutate(meetingDate = as.character(19110000 + meetingDate),
+           meetingDate = as.Date(meetingDate, format = "%Y%m%d")) 
+    
+gazette_selected$days <- as.numeric(gazette_selected$meetingDate -
+                                        min(gazette_selected$meetingDate))
+
+duplicated_gazette <- gazette_selected %>% 
+    filter(duplicated(subject) & duplicated(meetingDate))
+
+## 2. Legislators Info.
+legislator_raw <- read_csv("../rawdata/當屆委員資料.csv")
+legislator <- legislator_raw %>% 
+    mutate(name = str_replace_all(name, "[^\u4e00-\u9fff]", ""),
+           gender = as.factor(sex),
+           gender = ifelse(gender == "男", "Male", "Female"), 
+           type = case_when(str_detect(areaName, "原住民") ~ "原住民",
+                            str_detect(areaName, "全國不分區") ~ "不分區",
+                            str_detect(areaName, "選舉區") ~ "區域",
+                            TRUE ~ areaName),
+           ruling_party = ifelse(party == "民主進步黨", "Ruling", "Opposition"),
+           type = as.factor(type),
+           type_raw = as.factor(areaName)) %>% 
+    select(name, gender, type, type_raw, 
+           party, partyGroup, ruling_party, committee)
+
+## 3. Committees Info.
+ad_hoc_committees <- c("程序委員會", "紀律委員會", "修憲委員會",
+                       "經費稽核委員會", "調閱委員會")
+committee_info <- legislator %>% 
+    select(name, committee) %>% 
+    ## Remove 特種委員會
+    mutate(committee = str_remove_all(committee, 
+                                      paste(ad_hoc_committees, collapse = "|")),
+           committee = str_replace_all(committee, 
+                                       "第(\\d)+屆第(\\d)+會期：;", ""))
+    
+get_committee <- function(text, s) {
+    pattern = paste0("第(\\d)+屆第", s, "會期：(.+?);")
+    reuslt = str_extract_all(text, pattern) %>%
+        str_extract_all("：(.*?);") %>% 
+        unlist() %>% 
+        str_remove_all("[：;]") 
+    if (length(reuslt) == 0)
+        return(NA)
+    else
+        return(reuslt)
+}
+
+committee_info <- committee_info %>% 
+    mutate(session1 = map(committee, ~ get_committee(., 1)), 
+           session2 = map(committee, ~ get_committee(., 2)), 
+           session3 = map(committee, ~ get_committee(., 3)), 
+           session4 = map(committee, ~ get_committee(., 4)), 
+           session5 = map(committee, ~ get_committee(., 5)), 
+           session6 = map(committee, ~ get_committee(., 6)), 
+           session7 = map(committee, ~ get_committee(., 7)))
+
+committee_info <- committee_info %>% 
+    select(-committee) %>% 
+    pivot_longer(cols = starts_with("session"), 
+                                names_to = "sessionPeriod", 
+                                values_to = "committee") %>% 
+    mutate(sessionPeriod = str_replace(sessionPeriod, "session", ""),
+           sessionPeriod = as.numeric(sessionPeriod)) %>% 
+    rename(speaker = name)
+```
+
+Speech record
+```{r}
+# Set the directory path
+directory <- "../workdata/speech"
+
+## Get a list of file names in the directory
+file_list <- list.files(directory, pattern = "\\.csv$", full.names = TRUE)
+
+## Initialize an empty list to store the data frames
+df_list <- list()
+
+## Iterate over the file list and read each CSV file
+for (file in file_list) {
+    data <- read_csv(file)
+    df_list[[file]] <- data
+}
+rm(data)
+
+## Combine into one dataframe
+df_combined <- do.call(rbind, df_list)
+row.names(df_combined) <- NULL
+rm(df_list)
+```
+
+#### Data cleaning & Chinese word segmentation
+```{r}
+## Merge committee df to legislator df
+legislator_long <- legislator %>% 
+    rename(speaker = name) %>%
+    left_join(committee_info, by = "speaker") %>% 
+    select(-committee.x) %>% 
+    rename(committee = committee.y)
+
+## Name change or typo
+df_combined <- df_combined %>% 
+    mutate(speaker = str_replace(speaker, "洪申瀚", "洪申翰"),
+           speaker = str_replace(speaker, "葉毓蘭", "游毓蘭"),
+           speaker = str_replace(speaker, "蔣萬中", "蔣萬安")) 
+ 
+# Create id for each speaker_meeting and speech
+df_combined <- df_combined %>% 
+    mutate(speaker_meeting = str_c(speaker, meeting_id, sep = "_"),
+           speech_id = str_c(meeting_id, speech_number, sep = "_"))
+
+## Merge speech data wih gazette, legislator, and committee data
+df_combined <- df_combined %>%
+    right_join(gazette_selected, by = "meeting_id") %>% 
+    anti_join(duplicated_gazette, by = "meeting_id") %>% # remove duplicated meeting !
+    left_join(legislator_long, by = c("speaker", "sessionPeriod")) %>% 
+    select(meeting_id, speaker, speech_number, speaker_meeting, speech_id, speech_text, term, sessionPeriod, comYear, comVolume, comBookId, meetingDate, days, agendaNo, agendaType, subject, pageStart, pageEnd, gender, type, type_raw, party, partyGroup, ruling_party,  committee) 
+    
+n_distinct(df_combined$meeting_id) # Number of meeting 
+n_distinct(df_combined$speaker_meeting) # Number of speaker_meeting
+```
+
+```{r}
+## Remove numbers, punctuation(, English characters)
+df_combined <- df_combined %>% 
+    mutate(speech_text_raw = speech_text,
+           speech_text = gsub("[[:punct:]]", " ", speech_text),
+           speech_text = gsub("http\\w+", " ", speech_text),
+           # speech_text = gsub("[a-zA-Z]", " ", speech_text))
+           speech_text = gsub("[0-9]", " ", speech_text),
+           speech_text = gsub("//", " ", speech_text),
+           speech_text = gsub("/", " ", speech_text), 
+           speech_text = tolower(speech_text))
+
+## Using jiebaR to 中文斷詞
+stop = "./my_dictionary/stop_zhtw.txt"
+user = "./my_dictionary/taiwan_zhtw.txt"
+cutter <- worker(bylines = TRUE, stop_word = stop, user = user)
+cutter_mix <- worker(type = "mix", bylines = TRUE, stop_word = stop, user = user)
+
+unnest_df <- df_combined %>%
+    mutate(text = sapply(segment(speech_text, cutter_mix),
+                         function(x){paste(x, collapse = " ")})) %>%
+    unnest_tokens(word, text, token = "regex", pattern = " " , drop = F) %>%
+    mutate(character_n = nchar(word)) %>% 
+    filter(character_n > 1) 
+
+## Creat document per row dataframe
+document_data <- df_combined %>% 
+    group_by(speaker_meeting) %>% 
+    summarise(speech_text_raw = toString(speech_text_raw),
+              speech_text = toString(speech_text))
+```
+
+#### Convert to DocumentTermMatrix
+```{r}
+## Doucument level 1: each speech
+speech_word_counts <- unnest_df %>%
+    count(speech_id, word, sort = TRUE) %>%
+    ungroup()
+
+speech_dtm <- speech_word_counts %>%
+    arrange(speech_id) %>% 
+    cast_dtm(speech_id, word, n)
+
+## Doucument level 2: each speaker-meeting combination
+speaker_meeting_word_counts <- unnest_df %>%
+    count(speaker_meeting, word, sort = TRUE) %>%
+    ungroup()
+
+speaker_meeting_dtm <- speaker_meeting_word_counts %>%
+    arrange(speaker_meeting) %>%
+    cast_dtm(speaker_meeting, word, n)
+```
+
+Store data
+```{r}
+save(df_combined, gazette_selected, legislator, committee_info,
+     document_data, unnest_df, speaker_meeting_word_counts,
+     speaker_meeting_dtm, file = "../workdata/data_cleaned.RData")
+```
+
+
+### LDA
+
+#### Fit LDA
+**Time consuming!**
+```{r}
+speech_lda <- LDA(speech_dtm, k = 25, control = list(seed = 1234))
+speaker_meeting_lda <- LDA(speaker_meeting_dtm, k = 25, control = list(seed = 1234))
+save(speech_lda, speaker_meeting_lda, file = "../workdata/LDA_fit.RData")
+```
+
+```{r}
+load("../workdata/LDA_fit.RData")
+```
+
+Take a look at posterior distributions to check results
+```{r}
+tmResult <- posterior(speaker_meeting_lda)
+attributes(tmResult)
+nTerms(speaker_meeting_dtm) # length of vocab (terms)
+nDocs(speaker_meeting_dtm) # size of collection (documents)
+
+## Beta
+beta <- tmResult$terms   # get beta from results
+dim(beta)                # K distributions over terms
+rowSums(beta)            # topics are probability distributions over the entire vocabulary, so rows in beta should sum to 1
+
+## Gamma
+theta <- tmResult$topics 
+dim(theta)               # nDocs(DTM) distributions over K topics
+rowSums(theta)[1:10]     # for every document we have a probability distribution of its contained topic, so rows in theta should sum to 1
+
+terms(speaker_meeting_lda, 10) # 10 most likely terms within the term probabilities beta of the inferred topics
+
+top5termsPerTopic <- terms(speaker_meeting_lda, 8)
+topicNames <- apply(top5termsPerTopic, 2, paste, collapse = " ")
+topicNames2 <- apply(lda::top.topic.words(beta, 8, by.score = T), 2, paste, collapse = " ") # re-rank top topic terms for topic names
+```
+
+#### Visualization of words and topics
+```{r}
+wordcloud_for_a_topic <- function(topic, n_words = 60) {
+    topicToViz <- topic
+    # topicToViz <- grep('mexico', topicNames)[1] # select a topic by a term contained in its name
+    
+    ## select to  most probable terms from the topic by sorting the term-topic-probability vector in decreasing order
+    top_terms <- sort(tmResult$terms[topicToViz, ],
+                      decreasing = TRUE)[1:n_words]
+    words <- names(top_terms)
+
+    ## extract the probabilites of each of the 40 terms
+    probabilities <- sort(tmResult$terms[topicToViz, ],
+                          decreasing = TRUE)[1:n_words]
+
+    ## visualize the terms as wordcloud
+    wordcloud2(tibble(words, probabilities), 
+           shape = "circle", size = .6, 
+           color = "random-light", backgroundColor = "black")
+}
+
+wordcloud_for_a_topic(25)
+```
+
+*Doucument level 1: each speech*
+```{r}
+speech_topics <- tidy(speech_lda, matrix = "beta")
+
+top_terms <- speech_topics %>%
+    group_by(topic) %>%
+    top_n(10, beta) %>%
+    ungroup() %>%
+    arrange(topic, -beta)
+
+top_terms %>%
+    mutate(term = reorder(term, beta)) %>%
+    ggplot(aes(term, beta, fill = factor(topic))) +
+    geom_col(show.legend = FALSE) +
+    facet_wrap(~ topic, scales = "free") +
+    coord_flip() + 
+    theme(axis.text.y = element_text(size = 8),
+          axis.text.x = element_text(size = 6),
+          plot.title = element_text(size = 8),
+          text = element_text(family = "jf金萱3.1 半糖"))
+```
+
+
+*Doucument level 2: speaker_meeting*
+```{r}
+speaker_meeting_topics <- tidy(speaker_meeting_lda, matrix = "beta")
+
+top_terms <- speaker_meeting_topics %>%
+    group_by(topic) %>%
+    top_n(10, beta) %>%
+    ungroup() %>%
+    arrange(topic, -beta)
+
+top_terms %>%
+    mutate(term = reorder(term, beta)) %>%
+    ggplot(aes(term, beta, fill = factor(topic))) +
+    geom_col(show.legend = FALSE) +
+    facet_wrap(~ topic, scales = "free") +
+    coord_flip() + 
+    theme(axis.text.y = element_text(size = 8),
+          axis.text.x = element_text(size = 6),
+          plot.title = element_text(size = 8),
+          text = element_text(family = "jf金萱3.1 半糖"))
+```
+
+#### Visualization of documents and topics
+```{r}
+set.seed(287)
+example_speaker_n = 5
+
+theta2 <- as.data.frame(theta) %>% mutate(document = row.names(theta))
+
+example_document_id <- sample(unique(df_combined$meeting_id), 1)
+example_document <- df_combined %>% 
+    filter(meeting_id == example_document_id) %>% 
+    group_by(speaker) %>% 
+    summarise(document = first(speaker_meeting)) %>% 
+    slice_sample(n = example_speaker_n) %>% 
+    left_join(theta2, by = "document") 
+
+colnames(example_document) <- c("speaker", "document",
+                               paste0(" ", topicNames2))
+
+vizDataFrame <- example_document %>% 
+    pivot_longer(cols = starts_with(" "),
+                 names_to = "topic",
+                 values_to = "proportion")
+
+## Meeting Info,
+meeting_subject <- as.character(df_combined[df_combined$meeting_id == example_document_id,]$subject[1]) 
+meeting_subject <- strsplit(meeting_subject, "(?<=.{55})", perl = TRUE)[[1]]
+meeting_subject <- paste(meeting_subject, collapse = "\n")
+
+meeting_date <- as.character(df_combined[df_combined$meeting_id == example_document_id,]$meetingDate[1]) 
+
+ggplot(data = vizDataFrame, aes(topic, proportion, fill = speaker), 
+       ylab = "proportion") + 
+    geom_bar(stat = "identity", show.legend = FALSE) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    coord_flip() +
+    facet_wrap(~ speaker, ncol = example_speaker_n) +
+    theme(axis.text.y = element_text(size = 8),
+          axis.text.x = element_text(size = 6),
+          plot.title = element_text(2),
+          text = element_text(family = "jf金萱3.1 半糖")) +
+    labs(caption = meeting_subject)
+```
+
+#### Topics by legislators
+```{r}
+speaker_meeting_data <- df_combined %>% 
+    group_by(speaker_meeting) %>% 
+    summarise(speaker = first(speaker), 
+              speech_n = n()) 
+
+too_few_speaker <- count(df_combined, speaker) %>%
+    arrange(n) %>% 
+    slice_head(n = n_distinct(df_combined$speaker) - 30)
+
+speaker_gamma <- tidy(speaker_meeting_lda, matrix = "gamma")
+speaker_gamma %>% 
+    rename(speaker_meeting = document) %>% 
+    left_join(speaker_meeting_data, by = "speaker_meeting") %>% 
+    mutate(speaker = reorder(speaker, gamma * topic)) %>% 
+    anti_join(too_few_speaker, by = "speaker") %>% 
+    group_by(speaker_meeting) %>%
+    slice_max(gamma) %>%
+    ggplot(aes(factor(topic), gamma)) +
+        geom_boxplot() + 
+        facet_wrap(~ speaker) +
+        theme(axis.text.y = element_text(size = 6),
+              axis.text.x = element_text(size = 6),
+              plot.title = element_text(size = 8),
+              text = element_text(family = "jf金萱3.1 半糖"))
+```
+
+#### Topic by time (session periods)
+```{r}
+library(randomcoloR)
+set.seed(123)
+my_colors <- randomColor(30)
+
+topicNames_df <- terms(speaker_meeting_lda, 6) %>% 
+    apply(2, paste, collapse = " ") %>%
+    as.data.frame() %>% 
+    mutate(topic = row_number())
+colnames(topicNames_df)[1] <- "topicNames"
+
+tidy(speaker_meeting_lda, matrix = "gamma") %>%
+    mutate(meeting_id = str_remove(document, ".*?_")) %>% 
+    left_join(gazette_selected, by = "meeting_id") %>% 
+    group_by(topic, sessionPeriod) %>% 
+    summarize(mean_topic_proportion = mean(gamma)) %>% 
+    left_join(topicNames_df, by = "topic") %>% 
+    ggplot(aes(sessionPeriod, mean_topic_proportion, 
+               fill = topicNames)) +
+        geom_bar(stat = "identity") + 
+        ylab("proportion") +
+        theme(axis.text.y = element_text(size = 6, 
+                                         angle = 90, hjust = 1),
+              axis.text.x = element_text(size = 6),
+              plot.title = element_text(size = 8),
+              legend.text = element_text(size = 7),
+              text = element_text(family = "jf金萱3.1 半糖")) +
+        scale_fill_manual(values = my_colors)
+```
+
+
+### STM
+
+Load related dataframe
+```{r}
+load("../workdata/data_cleaned.RData")
+```
+
+#### Ingsest and prepare data
+```{r}
+metadata <- df_combined %>% 
+    filter(speaker_meeting %in%
+               speaker_meeting_word_counts$speaker_meeting) %>%
+    group_by(speaker_meeting) %>% 
+    summarise(speaker = first(speaker),
+              term = first(term),
+              sessionPeriod = first(sessionPeriod),
+              meetingDate = first(meetingDate),
+              days = first(days),
+              agendaType = first(agendaType),
+              gender = first(gender),
+              type = first(type), 
+              party = first(party), 
+              partyGroup = first(partyGroup), 
+              ruling_party = first(ruling_party),
+              committee = committee[1]) %>% # 如果同時有兩個委員會，該如何處理？
+    arrange(speaker_meeting)
+
+processed <- readCorpus(speaker_meeting_dtm, type = "dtm")
+
+n_distinct(metadata$speaker_meeting)
+length(processed$documents)
+
+plotRemoved(processed$documents, lower.thresh = seq(1, 200, 10))
+out <- prepDocuments(processed$documents, 
+                     processed$vocab, meta = metadata, 
+                     lower.thresh = 20)
+docs <- out$documents
+vocab <- out$vocab
+meta <- out$meta
+
+length(docs)
+nrow(meta)
+
+# meta %>% count(type)
+# meta %>% filter(is.na(type))
+```
+
+Check whether documents and metadata are correctly linked 
+```{r}
+i = 123
+inspect(speaker_meeting_dtm[i,][1,1:5])
+test_id = metadata$speaker_meeting[i]
+speaker_meeting_word_counts$word[speaker_meeting_word_counts$speaker_meeting == test_id]
+for (c in processed$documents[[i]][1,]) {
+    print(processed$vocab[c])
+}
+```
+
+#### Model search across the number of topic
+**Time consuming!**
+```{r}
+storage <- searchK(out$documents, out$vocab, K = seq(5, 50, 5),
+                   prevalence = ~ type + party + gender + s(sessionPeriod), 
+                   data = out$meta, cores = 10, verbose = F,
+                   seed = 123)
+
+save(storage, file = "../workdata/search_for_k.rData")
+```
+
+```{r}
+load("../workdata/search_for_k.rData")
+
+## Diagnosis PLot
+png("../output/F1-1 diagnosis.png", width = 2680, height = 1880, res = 400)
+plot(storage)
+dev.off() 
+exclusivity <- storage$results$exclus %>% unlist()
+coherence <- storage$results$semcoh %>% unlist()
+k <- paste0("K=", storage$results$K %>% unlist())
+
+## Plot Model Seacrh for k
+library("ggrepel")  
+ggplot()  +
+    geom_point(aes(coherence, exclusivity, color = k), size = 2.75) +
+    geom_text_repel(aes(coherence, exclusivity, label = k), fontface = "bold",
+              nudge_x = .25, nudge_y = -.005, size = 3, alpha = .8) +
+    labs(x = 'Semantic Coherence', y = 'Exclusivity') + 
+    theme_light() + 
+    theme(axis.title.x = element_text(face = "bold"),
+          axis.title.y = element_text(face = "bold"),
+          legend.position = "none")
+ggsave("../output/F1-2 search_k.png")
+
+write_csv(as.data.frame(storage$results), "../output/search_k_table.csv")
+```
+
+#### Estimation
+**Time consuming!**
+```{r}
+stm20.fit <- stm(documents = out$documents, vocab = out$vocab, K = 20, 
+                 prevalence = ~ type + party + gender + s(sessionPeriod),
+                 max.em.its = 75, data = out$meta, 
+                 init.type = "Spectral", verbose = F, seed = 123)
+
+stm15.fit <- stm(documents = out$documents, vocab = out$vocab, K = 15, 
+                 prevalence = ~ type + party + gender + s(sessionPeriod),
+                 max.em.its = 75, data = out$meta,
+                 init.type = "Spectral", verbose = F, seed = 321)
+
+stm15_type.fit <- stm(documents = out$documents, vocab = out$vocab, K = 15,
+                      prevalence =  ~ type + party + gender + s(sessionPeriod),
+                      content = ~ type,
+                      max.em.its = 75, data = out$meta,
+                      init.type = "Spectral", verbose = F, seed = 123)
+
+stm15_gender.fit <- stm(documents = out$documents, vocab = out$vocab, K = 15,
+                      prevalence = ~ type + party + gender + s(sessionPeriod),
+                      content = ~ gender,
+                      max.em.its = 75, data = out$meta,
+                      init.type = "Spectral", verbose = F, seed = 123)
+
+stm15_party.fit <- stm(documents = out$documents, vocab = out$vocab, K = 15,
+                      prevalence = ~ type + party + gender + s(sessionPeriod),
+                      content = ~ party,
+                      max.em.its = 75, data = out$meta,
+                      init.type = "Spectral", verbose = F, seed = 123)
+
+stm15_ruling.fit <- stm(documents = out$documents, vocab = out$vocab, K = 15,
+                      prevalence = ~ type + party + gender + s(sessionPeriod),
+                      content = ~ ruling_party,
+                      max.em.its = 75, data = out$meta,
+                      init.type = "Spectral", verbose = F, seed = 123)
+
+save(stm20.fit, stm15.fit, stm15_type.fit, 
+     stm15_gender.fit, stm15_party.fit, stm15_ruling.fit, 
+     file = "../workdata/stm_fit.rData")
+```
+
+```{r}
+load("../workdata/stm_fit.rData")
+```
+
+#### Words that associated with topics
+```{r}
+labelTopics(stm20.fit)
+labelTopics(stm15.fit)
+
+# K = 20
+png("../output/F2-1 stm_20.png", width = 3180, height = 1880, res = 425)
+par(bty = "n", col = "grey10", lwd = 5)
+plot.STM(stm20.fit, family = "jf金萱3.1 半糖",
+         labeltype = "frex", text.cex = .6, n = 8, 
+         main = "Top topic (K = 20)")
+dev.off()  
+
+# K = 15, frex
+png("../output/F2-2 stm_15_frex.png", width = 4180, height = 2080, res = 400)
+par(bty = "n", col = "grey10", lwd = 5)
+plot.STM(stm15.fit, family = "jf金萱3.1 半糖", xlim = c(0, .21),
+         labeltype = "frex", text.cex = .9, n = 8,
+         main = "Top topic (K = 15)")
+dev.off()  
+
+# K = 15, prob
+png("../output/F2-2 stm_15_prob.png", width = 4180, height = 2080, res = 400)
+par(bty = "n", col = "grey10", lwd = 5)
+plot.STM(stm15.fit, family = "jf金萱3.1 半糖", xlim = c(0, .21),
+         text.cex = .9, n = 8,
+         main = "Top topic (K = 15)")
+dev.off()  
+
+# K = 15, prob, with content covariate
+plot.STM(stm15_gender.fit, family = "jf金萱3.1 半糖", xlim = c(0, .22),
+         text.cex = .9, n = 8,
+         main = "Top topic (K = 15)")
+```
+
+Wordcloud
+```{r}
+folder_path <- "../output/F2-3 stm_15_cloud"
+if (!file.exists(folder_path)) dir.create(folder_path)
+
+library(RColorBrewer)
+for (t in 1:15) { 
+    png(paste0("../output/F2-3 stm_15_cloud/F2-3 stm_15_cloud_topic", t, ".png"),
+        width = 1280, height = 1280, res = 380)
+    cloud(stm15.fit, topic = t,
+          min.freq = 5,
+          max.words = 200,
+          random.order = FALSE,
+          rot.per = 0,
+          colors = brewer.pal(8, "Dark2"),
+          family = "jf金萱3.1 三分糖")
+    dev.off()
+}
+```
+
+#### Documents that associated with topics
+```{r}
+shortdoc <- document_data %>% 
+    filter(speaker_meeting %in% meta$speaker_meeting) %>% 
+    mutate(short_text = substr(speech_text_raw, 1, 475)) 
+shortdoc <- shortdoc$short_text
+
+library(gridExtra)
+library(cowplot)
+myPlotQuote <- function(model, texts, topic, n = 3) {
+    thoughts <- findThoughts(model, texts = shortdoc, n = n, 
+                             topics = topic)$docs[[1]]
+    
+    # for (i in 1:n) {
+    #     cat(thought[i], "\n\n")
+    # }
+    
+    plot_list <- list()
+    for (i in 1:n) {
+        text <- strsplit(thoughts[i], "(?<=.{60})", perl = TRUE)[[1]]
+        text <- paste(text, collapse = "\n")
+        text <- paste0(text, "...")
+        
+        p <- ggplot(mtcars, aes(x = mpg, y = wt)) + 
+        geom_text(aes(x = mean(range(mpg)), y = mean(range(wt))),
+                      label = text, size = 3, 
+             family = "jf金萱3.1 三分糖", color = "black") +
+        theme_void()
+        
+        plot_list[[i]] <- p
+    }
+    
+    main = paste("Topic", t)
+    main_title <- ggdraw() + draw_label(main, size = 14)
+    combined <- arrangeGrob(grobs = plot_list, ncol = 1)
+    final_plot <- plot_grid(main_title, combined,
+                            ncol = 1, rel_heights = c(0.1, 0.9))
+    print(final_plot)
+}
+
+folder_path <- "../output/F2-4 original_document/"
+if (!file.exists(folder_path)) dir.create(folder_path)
+
+for (t in 1:15) { 
+    png(paste0("../output/F2-4 original_document/F2-4 original_document", 
+               t, ".png"),
+        width = 2680, height = 1880, res = 350)
+    myPlotQuote(stm15.fit, docs, t)
+    dev.off()  
+}
+```
+
+#### Give topic names/labels
+```{r}
+topic_name_vector <- c("性別與兒少議題", "醫療專業團體", "社褔保險與基金", "勞工政策", "國民健康", "移工政策", "法律程序相關用語", "疫苗議題", "社會安全網", "質詢相關用語", "防疫政策", "環保議題", "醫療技術發展", "社會救助與補助", "弱勢族群權益")
+
+topic_namet1_vector <- topic_name_vector
+topic_namet2_vector <- topic_name_vector
+for (t in 1:length(topic_name_vector)) {
+  topic_namet1_vector[t] <- paste0("Topic ", t, ": ", topic_name_vector[t])
+  topic_namet2_vector[t] <- paste0(t, ": ", topic_name_vector[t])
+}
+
+topic_name <- data.frame(topic = 1:15, name = topic_name_vector,
+                         namet1 = topic_namet1_vector,
+                         namet2 = topic_namet2_vector)
+```
+
+
+#### Estimating metadata/topic relationships
+```{r}
+names(meta)
+prep <- estimateEffect(1:15 ~ type + party + gender + s(sessionPeriod),
+                       stm15.fit, metadata = meta, 
+                       uncertainty = "Global")
+# summary(prep)
+```
+
+**Approch 1**
+```{r}
+## Binary
+plot.estimateEffect(prep, covariate = "gender", topics = 1:15,
+     model = stm15.fit, method = "difference",
+     cov.value1 = "Male", cov.value2 = "Female",
+     xlab = "More Female ... Mor Male",
+     main = "Effect of Gender",
+     xlim = c(-.1, .1), labeltype = "numbers", verbose.labels = F)
+
+## Factor
+plot(prep, covariate = "party", topics = c(1),
+     model = stm15.fit, method = "pointestimate",
+     family = "jf金萱3.1 半糖", 
+     labeltype = "custom",
+     custom.labels = c("DPP", "KMT", "TPP", "Non", "NPP", "TSP"))
+
+# p$labels
+```
+
+```{r}
+library(tidystm)
+extract.estimateEffect(prep, "party", model = stm15.fit, method = "pointestimate") %>% view
+```
+
+**Approch 2**
+*Binary: Gender*
+```{r}
+effects <- get_effects(estimates = prep,
+                       variable = 'gender',
+                       type = 'difference',
+                       cov_val1 = "Female", cov_val2 = "Male")  # proprotion of cov_val1 - col_val2
+
+effects %>% 
+    ggplot(aes(x = reorder(topic, -difference), y = difference)) +
+    geom_point(size = 2) +
+    geom_errorbar(aes(y = difference, ymin = lower, ymax = upper), 
+                  width = 0, size = .55) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    labs(title = 'The Effect of Speaker Gender', 
+         x = "Topic", y = 'More Female ..... More Male') +
+    theme_light() +
+    coord_flip() +
+    theme(axis.text.y = element_text(face = "bold"),
+          axis.title.x = element_text(face = "bold"),
+          axis.title.y = element_text(face = "bold"),
+          plot.title = element_text(face = "bold"),
+          legend.position = "none")
+
+lab_name <- levels(reorder(topic_name$namet2, -effects$difference))
+effects %>% 
+    ggplot(aes(x = reorder(topic, -difference), y = difference)) +
+    geom_point(size = 1.75) +
+    geom_errorbar(aes(y = difference, ymin = lower, ymax = upper), 
+                  width = 0, size = .5) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    labs(title = 'The Effect of Speaker Gender', 
+         x = "Topic", y = 'More Female ..... More Male') +
+    theme_light() +
+    coord_flip() +
+    theme(axis.text.y = element_text(family = "jf金萱3.1 半糖"),
+          axis.title.x = element_text(face = "bold"),
+          axis.title.y = element_text(face = "bold"),
+          plot.title = element_text(face = "bold"),
+          text = element_text(family = "jf金萱3.1 半糖")) +
+    scale_x_discrete(labels = lab_name)
+ggsave("../output/F3-1 gender.png", width = 7, height = 4.5, dpi = 300)
+```
+
+*Binary: Ruling Party*
+```{r}
+prep_ruling <- estimateEffect(1:15 ~ type + ruling_party + gender +
+                                  s(sessionPeriod),
+                       stm15.fit, metadata = meta, 
+                       uncertainty = "Global")
+effects <- get_effects(estimates = prep_ruling,
+                       variable = 'ruling_party',
+                       type = 'difference',
+                       cov_val1 = "Ruling", cov_val2 = "Opposition")  # proprotion of cov_val1 - col_val2
+
+lab_name <- levels(reorder(topic_name$namet2, -effects$difference))
+effects %>% 
+    ggplot(aes(x = reorder(topic, -difference), y = difference)) +
+    geom_point(size = 1.75) +
+    geom_errorbar(aes(y = difference, ymin = lower, ymax = upper), 
+                  width = 0, size = .5) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    labs(title = 'The Effect of Ruling or Opposition Party', 
+         x = "Topic", y = 'More Opposition Party ..... More Ruling Party') +
+    theme_light() +
+    coord_flip() +
+    ylim(NA, .074) +
+    theme(axis.text.y = element_text(family = "jf金萱3.1 半糖"),
+          axis.title.x = element_text(face = "bold"),
+          axis.title.y = element_text(face = "bold"),
+          plot.title = element_text(face = "bold"),
+          text = element_text(family = "jf金萱3.1 半糖")) +
+    scale_x_discrete(labels = lab_name)
+ggsave("../output/F3-2 ruling_party.png", width = 7, height = 4.5, dpi = 300)
+```
+
+*Factor: Party*
+```{r}
+## Party
+effects <- get_effects(estimates = prep,
+                       variable = 'party',
+                       type = 'pointestimate')
+
+## Only one topic
+t = 13
+effects %>% 
+    filter(topic %in% c(t)) %>% 
+    ggplot(aes(x = reorder(value, proportion), y = proportion)) +
+    geom_errorbar(aes(ymin = lower, ymax = upper),
+                  width = 0, size = 0.55) +
+    geom_point(size = 2.5) +
+    labs(title = paste('Topic', t), x = 'Party', y = 'Topic Proportion') + 
+    theme_light() +
+    coord_flip() +
+    theme(axis.text.y = element_text(size = 8),
+          axis.text.x = element_text(size = 6),
+          plot.title = element_text(size = 12),
+          text = element_text(family = "jf金萱3.1 半糖"))
+
+## By party
+library(ggh4x)
+party_color <-  c("#000095", "#1B9431", "#28C8C8", "#F9BE01", "#A73f24", "gray")
+strip <- strip_themed(background_x = elem_list_rect(fill = alpha(party_color, .65)))
+
+effects <- effects %>%
+    filter(topic %in% 1:15) %>% 
+    mutate(topic_c = topic, topic = as.numeric(as.character(topic))) %>% 
+    arrange(topic) %>% 
+    left_join(topic_name, by = "topic") %>% 
+    mutate(namet2 = as.factor(namet2)) 
+levels(effects$namet2) <- topic_namet2_vector
+
+effects %>% 
+    ggplot(aes(x = topic, y = proportion, fill = namet2)) +
+    geom_errorbar(aes(ymin = lower, ymax = upper), width = 0, size = .2) +
+    geom_point(size = 1.15) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    theme_light() +
+    labs(x = 'Topic', y = 'Topic Proportion', fill = "      Topic Label") +
+    facet_wrap2(~ factor(value, levels=c('中國國民黨', '民主進步黨', '台灣民眾黨',
+                                         '時代力量', '台灣基進', "無黨籍")), 
+                strip = strip, ncol = 3) +
+    scale_x_continuous(breaks = 1:15) +
+    theme(axis.text.y = element_text(size = 6),
+          axis.text.x = element_text(size = 6.5, angle = 60,
+                                     hjust = -.05, vjust = .05), 
+          text = element_text(family = "jf金萱3.1 半糖"),
+          legend.title = element_text(family = "jf金萱3.1 七分糖"),
+          legend.margin = margin(0, 0, 0, -10),
+          strip.text = element_text(colour = 'gray15', 
+                                    family = "jf金萱3.1 七分糖")) +
+    guides(fill = guide_legend(override.aes = list(shape = NA)))
+ggsave("../output/F3-3_1 party.png", width = 8, height = 4.5, dpi = 300)
+
+
+effects %>% 
+    mutate(topic = reorder_within(topic, proportion, value)) %>%
+    ggplot(aes(x = topic, y = proportion, 
+               fill = namet2)) +
+    geom_errorbar(aes(ymin = lower, ymax = upper), width = 0, size = .2) +
+    geom_point(size = 1.15) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    theme_light() +
+    coord_flip() +
+    labs(x = 'Topic', y = 'Topic Proportion', fill = "      Topic Label") +
+    facet_wrap2(~ factor(value, levels=c('中國國民黨', '民主進步黨', '台灣民眾黨',
+                                         '時代力量', '台灣基進', "無黨籍")), 
+                strip = strip, ncol = 3, scales = "free_y") +
+    theme(axis.text.y = element_text(size = 6, family = "jf金萱3.1 七分糖"),
+          axis.text.x = element_text(size = 6.5), 
+          text = element_text(family = "jf金萱3.1 半糖"),
+          legend.title = element_text(family = "jf金萱3.1 七分糖"),
+          legend.margin = margin(0, 0, 0, -10),
+          strip.text = element_text(colour = 'gray15', 
+                                    family = "jf金萱3.1 七分糖")) +
+    scale_x_reordered() +
+    guides(fill = guide_legend(override.aes = list(shape = NA)))
+ggsave("../output/F3-3_2 party.png", width = 8, height = 4.5, dpi = 300)
+```
+
+*Factor: Type*
+```{r}
+## Type
+effects <- get_effects(estimates = prep,
+                       variable = 'type',
+                       type = 'pointestimate')
+
+effects <- effects %>%
+    filter(topic %in% 1:15) %>% 
+    mutate(topic = as.numeric(as.character(topic))) %>% 
+    arrange(topic) %>% 
+    left_join(topic_name, by = "topic") %>% 
+    mutate(namet2 = as.factor(namet2)) 
+levels(effects$namet2) <- topic_namet2_vector
+
+effects %>% 
+    ggplot(aes(x = value, y = proportion, color = value)) +
+    geom_errorbar(aes(ymin = lower, ymax = upper), width = 0, size = .5) +
+    geom_point(size = 2) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    theme_light() +
+    labs(x = 'Type', y = 'Topic Proportion') +
+    facet_wrap2(~ namet2, ncol = 5) +
+    theme(axis.text.y = element_text(size = 6),
+          axis.text.x = element_text(size = 8),
+          text = element_text(family = "jf金萱3.1 七分糖"),
+          strip.text = element_text(colour = 'black', 
+                                    family = "jf金萱3.1 七分糖"), 
+          legend.position = "none") 
+ggsave("../output/F3-4 type.png", width = 11, height = 7, dpi = 500)
+```
+
+*Factor: Speaker*
+```{r}
+prep <- estimateEffect(1:15 ~ speaker,
+                       stm15.fit, metadata = meta, 
+                       uncertainty = "Global")
+
+## 3. Speaker
+effects <- get_effects(estimates = prep,
+                       variable = 'speaker',
+                       type = 'pointestimate')
+
+selected_speaker <- df_combined %>%
+    group_by(speaker) %>% 
+    summarise(meeting_n = n_distinct(speaker_meeting)) %>% 
+    arrange(desc(meeting_n)) %>% 
+    slice_max(meeting_n, n = 12) 
+
+effects <- effects %>% 
+    as.data.frame() %>% 
+    filter(value %in% selected_speaker$speaker) 
+
+## By speaker
+effects %>%
+    filter(topic %in% 1:15) %>%
+    mutate(topic = as.numeric(as.character(topic))) %>% 
+    arrange(topic) %>% 
+    ggplot(aes(x = topic, y = proportion)) +
+    geom_errorbar(aes(ymin = lower, ymax = upper), width = 0, size = .175) +
+    geom_point(size = .85) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    theme_light() +
+    # coord_flip() + 
+    labs(x = 'Topic', y = 'Proportion') +
+    facet_wrap(~ factor(value), ncol = 4, scales = "free_y") +
+    scale_x_continuous(breaks = 1:15) +
+    theme(axis.text.y = element_text(size = 5),
+          axis.text.x = element_text(size = 6, angle = 60,
+                                     hjust = -.05, vjust = .05),
+          text = element_text(family = "jf金萱3.1 半糖"),
+          strip.text = element_text(colour = 'black', size = 6))
+ggsave("../output/F3-5 speaker.png", width = 7, height = 5, dpi = 300)
+```
+
+Continous without interaction effects
+```{r}
+prep_day <- estimateEffect(1:15 ~ type + gender + party + s(days),
+                       stm15.fit, metadata = meta, 
+                       uncertainty = "Global")
+
+## Approch 1
+plot(prep_day, "days", method = "continuous", topics = 6,
+     model = stm15.fit)
+
+## Approch 2
+effects_day <- get_effects(estimates = prep_day,
+                           variable = 'days',
+                           type = 'continuous')
+
+effects_day$date <- as.Date(effects_day$value, origin = min(meta$meetingDate))
+
+effects_day %>% 
+    filter(topic %in% c(10, 12, 13, 14)) %>%
+    mutate(topic = as.numeric(as.character(topic))) %>% 
+    inner_join(topic_name, by = "topic") %>% 
+    ggplot(aes(x = date, y = proportion, 
+               color = namet2, group = namet2, fill = namet2)) +
+    geom_line(size = 1) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), alpha = .15, linetype = 0)  +
+    # geom_smooth(size = 1, fill = NA) +
+    theme_light() + 
+    labs(x = "Date", y = "Tpoci Proportion", fill = "Topic", color = "Topic") +
+    theme(axis.text.y = element_text(size = 8),
+          axis.text.x = element_text(size = 6),
+          axis.title.x = element_text(size = 10),
+          axis.title.y = element_text(size = 10),
+          text = element_text(family = "jf金萱3.1 半糖"),
+          aspect.ratio = .45) +
+    scale_x_date(breaks = "3 month", date_labels = "%Y.%m")
+ggsave("../output/F3-6 date.png")
+```
+
+*Interaction: Date by Party*
+```{r}
+prep_party <- estimateEffect(1:15 ~ type + gender + party * s(days),
+                       stm15.fit, metadata = meta, 
+                       uncertainty = "Global")
+
+effects_party <- get_effects(estimates = prep_party,
+                           variable = 'days',
+                           type = 'continuous',
+                           moderator = 'party',
+                           modval = "民主進步黨") %>% 
+    bind_rows(get_effects(estimates = prep_party,
+                          variable = 'days',
+                          type = 'continuous',
+                          moderator = 'party',
+                          modval = "中國國民黨")) %>% 
+    bind_rows(get_effects(estimates = prep_party,
+                          variable = 'days',
+                          type = 'continuous',
+                          moderator = 'party',
+                          modval = "時代力量")) %>% 
+    bind_rows(get_effects(estimates = prep_party,
+                          variable = 'days',
+                          type = 'continuous',
+                          moderator = 'party',
+                          modval = "台灣民眾黨")) 
+
+effects_party$date <- as.Date(effects_party$value, origin = min(meta$meetingDate))
+
+folder_path <- "../output/F3-7 date_by_party"
+if (!file.exists(folder_path)) dir.create(folder_path)
+
+for (t in 1:15) {
+    e <- effects_party %>% 
+        mutate(topic = as.numeric(as.character(topic))) %>% 
+        left_join(topic_name, by = "topic") %>% 
+        filter(topic == t)
+    
+    main = e$namet1[1]
+    
+    p <- e %>% 
+        mutate(moderator = as.factor(moderator)) %>%
+        ggplot(aes(x = date, y = proportion, color = moderator,
+                   group = moderator, fill = moderator)) +
+        geom_line(size = .7) +
+        # geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.175, linetype = 0)  +
+        theme_light() + 
+        labs(title = main, x = "Date", y = "Tpoci Proportion",
+             color = "Party") +
+        theme(axis.text.y = element_text(size = 8),
+              axis.text.x = element_text(size = 6),
+              plot.title = element_text(size = 14),
+              text = element_text(family = "jf金萱3.1 半糖"),
+              aspect.ratio = .6) +
+        scale_x_date(breaks = "4 month", date_labels = "%Y.%m") +
+        scale_color_manual(values = c("#000095", "#28C8C8", "#F9BE01", "#1B9431"))
+        
+    print(p)
+    ggsave(paste0("../output/F3-7 date_by_party/F3-7 date_by_party", t, ".png"), p)
+}
+```
+
+*Interaction: Date by Type*
+```{r}
+prep_type <- estimateEffect(1:15 ~ gender + party + type * s(days),
+                            stm15.fit, metadata = meta, 
+                            uncertainty = "Global")
+
+effects_type <- get_effects(estimates = prep_type,
+                           variable = 'days',
+                           type = 'continuous',
+                           moderator = 'type',
+                           modval = "區域") %>% 
+    bind_rows(get_effects(estimates = prep_type,
+                          variable = 'days',
+                          type = 'continuous',
+                          moderator = 'type',
+                          modval = "不分區")) %>% 
+    bind_rows(get_effects(estimates = prep_type,
+                          variable = 'days',
+                          type = 'continuous',
+                          moderator = 'type',
+                          modval = "原住民"))
+
+effects_type$date <- as.Date(effects_type$value, origin = min(meta$meetingDate))
+
+folder_path <- "../output/F3-8 date_by_type"
+if (!file.exists(folder_path)) dir.create(folder_path)
+
+for (t in 1:15) {
+    e <- effects_type %>% 
+        mutate(topic = as.numeric(as.character(topic))) %>% 
+        left_join(topic_name, by = "topic") %>% 
+        filter(topic == t)
+        
+    main = e$namet1[1]
+
+    p <- e %>% 
+        mutate(moderator = as.factor(moderator)) %>%
+        ggplot(aes(x = date, y = proportion, color = moderator,
+                   group = moderator, fill = moderator)) +
+        geom_line(size = .7) +
+        # geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.175, linetype = 0)  +
+        theme_light() + 
+        labs(title = main, x = "Date", y = "Tpoci Proportion",
+             color = "Type") +
+        theme(axis.text.y = element_text(size = 8),
+              axis.text.x = element_text(size = 6),
+              plot.title = element_text(size = 14),
+              text = element_text(family = "jf金萱3.1 半糖"),
+              aspect.ratio = .6) +
+        scale_x_date(breaks = "4 month", date_labels = "%Y.%m") +
+        scale_color_manual(values = c("#000095", "#28C8C8", "#F9BE01", "#1B9431"))
+        
+    print(p)
+    ggsave(paste0("../output/F3-8 date_by_type/F3-8 date_by_type", t, ".png"), p)
+}
+```
+
+#### Topical content
+*Gender*
+```{r}
+png("../output/F4-1 gender.png", width = 2680, height = 1880, res = 350)
+t = 15
+plot.STM(stm15_gender.fit, type = "perspectives", topics = t, 
+         family = "jf金萱3.1 半糖", text.cex = 1, main = paste("Topic", t))
+dev.off()
+```
+
+*Party*
+```{r}
+png("../output/F4-1 ruling_party.png", width = 2680, height = 1880, res = 350)
+t = 9
+plot.STM(stm15_ruling.fit, type = "perspectives", topics = t, 
+         family = "jf金萱3.1 半糖", text.cex = 1.25, main = paste("Topic", t))
+dev.off()
+
+
+plot.STM(stm15_party.fit, type = "perspectives", topics = 9, 
+         family = "jf金萱3.1 半糖", text.cex = 1.6,
+         topic.names = "test", 
+         covarlevels = c("民主進步黨", "中國國民黨"))
+```
+
+*Topic vs. Topic*
+```{r}
+png("../output/F4-2 content_topics.png", width = 2680, height = 1880, res = 350)
+plot(stm15.fit, type = "perspectives", topics = c(11, 14),
+     family = "jf金萱3.1 半糖")
+dev.off()  
+```
+
+#### Topic correlation
+```{r}
+mod.out.corr <- topicCorr(stm15.fit)
+plot(mod.out.corr)
+
+stm_corrs <- get_network(model = stm15.fit,
+                         method = 'simple',
+                         labels = paste('Topic', 1:15),
+                         # labels = topic_namet2_vector,
+                         cutoff = .0001,
+                         # cutoff = .001,
+                         cutiso = F)
+
+# mod.out.corr$cor %>% View 
+
+set.seed(123)
+library(ggraph)
+ggraph(stm_corrs) +
+  geom_edge_link(aes(edge_width = weight), edge_color = '#83c5be', 
+                 show.legend = F) +
+    geom_node_point(aes(size = props * 0.1), color = 'black', show.legend = F) +
+    geom_node_label(aes(label = name), size = 2.75, color = 'gray30', 
+                    repel = T, alpha = .95, family = "jf金萱3.1 七分糖") +
+    scale_size(range = c(.75, 7.95), labels = scales::percent) +
+    scale_edge_width(range = c(.35, 2.75)) +
+    labs(size = 'Topic Proportion',  edge_width = 'Topic Correlation') +
+    theme_graph() 
+ggsave("../output/F5-1 topics_network.png", width = 11, height = 6.5, dpi = 700)
+```
+
+#### Extracting Thetas
+```{r}
+theta <- stm15.fit$theta %>% as.data.frame()
+theta$speaker_meeting <- out$meta$speaker_meeting 
+
+set.seed(287)
+example_speaker_n = 6
+example_document_id <- sample(unique(df_combined$meeting_id), 1)
+
+## Meeting Info,
+meeting_subject <- as.character(df_combined[df_combined$meeting_id == example_document_id,]$subject[1]) 
+meeting_subject <- strsplit(meeting_subject, "(?<=.{65})", perl = TRUE)[[1]]
+meeting_subject <- paste(meeting_subject, collapse = "\n")
+
+meeting_date <- as.character(df_combined[df_combined$meeting_id == example_document_id,]$meetingDate[1]) 
+    
+meeting_subject <- paste0(meeting_date, ": ", meeting_subject)
+
+
+example_document <- df_combined %>% 
+    filter(meeting_id == example_document_id) %>% 
+    group_by(speaker) %>% 
+    summarise(n = n(), speaker_meeting = first(speaker_meeting)) %>%
+    slice_max(n, n = example_speaker_n) %>%  # select speakers in that meeting with most speech record
+    left_join(theta, by = "speaker_meeting")
+
+# colnames(example_document) <- c("speaker", "document", paste0(" ", topicNames2))
+
+example_document %>%
+    pivot_longer(cols = starts_with("V"),
+                 names_to = "topic",
+                 values_to = "proportion") %>% 
+    mutate(topic = as.numeric(str_remove(topic, "V"))) %>% 
+    left_join(topic_name, by = "topic") %>% 
+    ggplot(aes(reorder(namet2, -topic), proportion, fill = speaker)) + 
+    geom_bar(stat = "identity", show.legend = FALSE) +
+        coord_flip() +
+        facet_wrap(~ speaker, ncol = example_speaker_n) +
+        labs(x = "Topic", y = "Proportion", caption = meeting_subject) +
+         theme(axis.text.y = element_text(size = 10),
+               axis.text.x = element_text(size = 6.5), 
+               text = element_text(family = "jf金萱3.1 半糖"))
+ggsave("../output/F6-1 theta_one_meeint.png", width = 10, height = 6.5, dpi = 700)
+```
+
+```{r}
+library(randomcoloR)
+set.seed(123)
+my_colors <- randomColor(15, "random")
+
+theta_long <- theta %>%
+    pivot_longer(cols = V1:V15,
+               names_to = "topic",
+               values_to = "theta") %>% 
+    mutate(topic = as.numeric(str_remove(topic, "V")),
+           meeting_id = str_remove(speaker_meeting, ".*?_")) %>% 
+    left_join(gazette_selected, by = "meeting_id") %>% 
+    group_by(topic, sessionPeriod) %>%
+    summarize(mean_topic_proportion = mean(theta)) %>%
+    left_join(topic_name, by = "topic")
+
+theta_long$namet2 = factor(theta_long$namet2, levels = topic_namet2_vector)
+
+theta_long %>% 
+    ggplot(aes(sessionPeriod, mean_topic_proportion, fill = namet2)) +
+        geom_bar(stat = "identity") + 
+        labs(x = "Session Period", y = "Mean Topic Proportion", 
+             fill = "Topic Label") +
+        theme(axis.text.y = element_text(size = 8),
+              axis.text.x = element_text(size = 10),
+              text = element_text(family = "jf金萱3.1 半糖"),
+              legend.text = element_text(size = 12),
+              legend.title = element_text(size = 14, family = "jf金萱3.1 七分糖"),
+              axis.title.x = element_text(face = "bold"),
+              axis.title.y = element_text(face = "bold"),
+              legend.key.size = unit(.85, "cm")) +
+        scale_fill_manual(values = my_colors) +
+        scale_x_continuous(breaks = 1:7)
+ggsave("../output/F6-2 theta_session.png", width = 10, height = 6.5, dpi = 700)
+```
+
+
+```{r}
+# run_stminsights()
+
+# library(LDAvis)
+# toLDAvis(mod = stm20.fit, docs = docs)
+```
